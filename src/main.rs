@@ -15,12 +15,16 @@ use once_cell::sync::Lazy;
 
 use regex::Regex;
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+use htmlescape::decode_html;
 
 use log::error;
 
+const FRAGMENT: &AsciiSet = &CONTROLS.add(b';').add(b':').add(b'/').add(b',');
+
 static COOKIE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"([^=]+)=([^;]+)"#).unwrap());
-static INPUT_FIELDS: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(<input[^>]+type="([^"]+)"[^>]+name="([^"]+)"([^>]+value="([^"]+)")?([^>]+checked)?|<textarea[^>]+name="([^"]+)">(.*)</textarea>)"#).unwrap());
+static INPUT_FIELDS: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(<input[^>]+type="([^"]+)"[^>]+name="([^"]+)"([^>]+value="([^"]+)")?([^>]+checked)?|<textarea[^>]+name="([^"]+)"( required)?>([\s\S]*?)</textarea>)"#).unwrap());
 
 async fn call<C>(client: &Client<C>, method: &str, url: &str, headers: Option<HashMap<&str, String>>, body: Option<String>, mut cookies_jar: Option<&mut HashMap<String, String>>) -> Result<String, ()>
 where C: Connect + 'static,
@@ -110,9 +114,9 @@ async fn main() -> Result<(), ()> {
             headers.insert("Referer", format!("{}login", url));
             headers
         }), Some(format!("username-email={}&password={}&_csrf={}",
-            utf8_percent_encode(&username, NON_ALPHANUMERIC),
-            utf8_percent_encode(&password, NON_ALPHANUMERIC),
-            utf8_percent_encode(&cookies_jar["CSRF-TOKEN"], NON_ALPHANUMERIC)
+            utf8_percent_encode(&username, FRAGMENT),
+            utf8_percent_encode(&password, FRAGMENT),
+            utf8_percent_encode(&cookies_jar["CSRF-TOKEN"], FRAGMENT)
         )), Some(&mut cookies_jar)).await?;
 
     let (resolver, background) = AsyncResolver::new(ResolverConfig::default(), ResolverOpts::default());
@@ -121,12 +125,13 @@ async fn main() -> Result<(), ()> {
     loop {
         let body = call(&client, "GET", &format!("{}dashboard/settings", url), None, None, Some(&mut cookies_jar)).await?;
         let mut fields = HashMap::new();
-        INPUT_FIELDS.captures_iter(&body).for_each(|m| if let Some(key) = m.get(3).or_else(|| m.get(7)) {
-            if (m.get(2).map(|m| m.as_str()) == Some("checkbox") || m.get(2).map(|m| m.as_str()) == Some("radio")) && m.get(6).map(|m| m.as_str()) != Some(" checked") {
-                return;
+        for m in INPUT_FIELDS.captures_iter(&body){
+            if let Some(key) = m.get(3).or_else(|| m.get(7)) {
+                if !((m.get(2).map(|m| m.as_str()) == Some("checkbox") || m.get(2).map(|m| m.as_str()) == Some("radio")) && m.get(6).map(|m| m.as_str()) != Some(" checked")) {
+                    fields.insert(key.as_str(), decode_html(m.get(5).or_else(|| m.get(9)).map(|s| s.as_str()).unwrap_or_else(|| "")).map_err(|e| error!("Value decode error: {:?}", e))?);
+                }
             }
-            fields.insert(key.as_str(), m.get(5).or_else(|| m.get(8)).map(|s| s.as_str()).unwrap_or_else(|| "").to_string());
-        });
+        }
 
         let mut addresses = Vec::new();
         for ddns in ddnss.split(";") {
@@ -141,8 +146,9 @@ async fn main() -> Result<(), ()> {
         call(&client, "POST", &format!("{}dashboard/settings", url), Some({
                 let mut headers = HashMap::new();
                 headers.insert("Referer", format!("{}dashboard/settings", url));
+                headers.insert("Content-Type", String::from("application/x-www-form-urlencoded"));
                 headers
-            }), Some(fields.into_iter().map(|(k, v)| format!("{}={}", k, utf8_percent_encode(&v, NON_ALPHANUMERIC))).collect::<Vec<String>>().join("&")), Some(&mut cookies_jar)).await?;
+            }), Some(fields.into_iter().map(|(k, v)| format!("{}={}", k, utf8_percent_encode(&v, FRAGMENT))).collect::<Vec<String>>().join("&")), Some(&mut cookies_jar)).await?;
 
         delay_for(Duration::from_secs(60)).await;
     }
