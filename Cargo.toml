@@ -8,7 +8,11 @@ edition = "2018"
 
 [dependencies]
 tokio = "=0.2.0-alpha.6"
+futures-util-preview = "=0.3.0-alpha.19"
+hyper = { version = "=0.13.0-alpha.4", features = ["unstable-stream"] }
 trust-dns-resolver = "=0.18.0-alpha.1"
-mysql_async = "=0.21.0-alpha.4"
+once_cell = "1.2"
+regex = "1.3"
+percent-encoding = "2.1"
 log = "0.4"
 env_logger = "0.7"
