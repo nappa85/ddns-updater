@@ -33,7 +33,6 @@ where C: Connect + 'static,
     let mut url = url.to_string();
     let mut body = body;
     loop {
-        println!("url {}", url);
         let mut builder = Request::builder();
         builder.method(method).uri(&url);
         if let Some(ref jar) = cookies_jar {
@@ -53,7 +52,6 @@ where C: Connect + 'static,
         let chunks = stream.try_concat().await.map_err(|e| error!("error while reading response from {}: {}", url, e))?;
         let res_body = String::from_utf8(chunks.to_vec()).map_err(|e| error!("error while encoding response from {}: {}", url, e))?;
         if success || redirect {
-            println!("Head {:?}", head);
             if let Some(ref mut jar) = cookies_jar {
                 head.headers.get_all("Set-Cookie").into_iter().for_each(|c| {
                     if let Ok(s) = c.to_str() {
@@ -105,6 +103,7 @@ async fn main() -> Result<(), ()> {
     let username = env::var("RDM_USERNAME").map_err(|_| error!("Missing env var RDM_USERNAME"))?;
     let password = env::var("RDM_PASSWORD").map_err(|_| error!("Missing env var RDM_PASSWORD"))?;
     let ddnss = env::var("DDNS").map_err(|_| error!("Missing env var DDNS"))?;
+    let ddnss: Vec<&str> = ddnss.split(";").collect();
 
     let client = Client::new();
     let mut cookies_jar = HashMap::new();
@@ -126,6 +125,18 @@ async fn main() -> Result<(), ()> {
         let body = call(&client, "GET", &format!("{}dashboard/settings", url), None, None, Some(&mut cookies_jar)).await?;
         let mut fields = HashMap::new();
         for m in INPUT_FIELDS.captures_iter(&body){
+            /*
+             * 0 => full match
+             * 1 => OR match
+             * 2 => input type
+             * 3 => input name
+             * 4 => input value match
+             * 5 => input value
+             * 6 => input checked
+             * 7 => textarea name
+             * 8 => textarea required
+             * 9 => textarea value
+             */
             if let Some(key) = m.get(3).or_else(|| m.get(7)) {
                 if !((m.get(2).map(|m| m.as_str()) == Some("checkbox") || m.get(2).map(|m| m.as_str()) == Some("radio")) && m.get(6).map(|m| m.as_str()) != Some(" checked")) {
                     fields.insert(key.as_str(), decode_html(m.get(5).or_else(|| m.get(9)).map(|s| s.as_str()).unwrap_or_else(|| "")).map_err(|e| error!("Value decode error: {:?}", e))?);
@@ -134,21 +145,24 @@ async fn main() -> Result<(), ()> {
         }
 
         let mut addresses = Vec::new();
-        for ddns in ddnss.split(";") {
-            let response = resolver.lookup_ip(ddns).await.map_err(|e| error!("Failed to lookup \"{}\": {}", ddns, e))?;
+        for ddns in &ddnss {
+            let response = resolver.lookup_ip(*ddns).await.map_err(|e| error!("Failed to lookup \"{}\": {}", ddns, e))?;
 
             for address in response.iter() {
                 addresses.push(format!("{}", address));
             }
         }
-        fields.insert("deviceapi_host_whitelist", addresses.join(";"));
+        let addresses = addresses.join(";");
+        if fields["deviceapi_host_whitelist"] != addresses {
+            fields.insert("deviceapi_host_whitelist", addresses);
 
-        call(&client, "POST", &format!("{}dashboard/settings", url), Some({
-                let mut headers = HashMap::new();
-                headers.insert("Referer", format!("{}dashboard/settings", url));
-                headers.insert("Content-Type", String::from("application/x-www-form-urlencoded"));
-                headers
-            }), Some(fields.into_iter().map(|(k, v)| format!("{}={}", k, utf8_percent_encode(&v, FRAGMENT))).collect::<Vec<String>>().join("&")), Some(&mut cookies_jar)).await?;
+            call(&client, "POST", &format!("{}dashboard/settings", url), Some({
+                    let mut headers = HashMap::new();
+                    headers.insert("Referer", format!("{}dashboard/settings", url));
+                    headers.insert("Content-Type", String::from("application/x-www-form-urlencoded"));
+                    headers
+                }), Some(fields.into_iter().map(|(k, v)| format!("{}={}", k, utf8_percent_encode(&v, FRAGMENT))).collect::<Vec<String>>().join("&")), Some(&mut cookies_jar)).await?;
+        }
 
         delay_for(Duration::from_secs(60)).await;
     }
