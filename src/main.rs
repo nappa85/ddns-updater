@@ -2,11 +2,11 @@ use std::env;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use futures_util::try_stream::TryStreamExt;
+use futures_util::stream::TryStreamExt;
 
-use tokio::timer::delay_for;
+use tokio::time::delay_for;
 
-use trust_dns_resolver::AsyncResolver;
+use trust_dns_resolver::TokioAsyncResolver;
 use trust_dns_resolver::config::*;
 
 use hyper::{client::{Client, connect::Connect}, Request, Body};
@@ -27,20 +27,21 @@ static COOKIE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"([^=]+)=([^;]+)"#).unwra
 static INPUT_FIELDS: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(<input[^>]+type="([^"]+)"[^>]+name="([^"]+)"([^>]+value="([^"]+)")?([^>]+checked)?|<textarea[^>]+name="([^"]+)"( required)?>([\s\S]*?)</textarea>)"#).unwrap());
 
 async fn call<C>(client: &Client<C>, method: &str, url: &str, headers: Option<HashMap<&str, String>>, body: Option<String>, mut cookies_jar: Option<&mut HashMap<String, String>>) -> Result<String, ()>
-where C: Connect + 'static,
+where C: Connect + Clone + Send + Sync + 'static,
 {
     let mut method = method;
     let mut url = url.to_string();
     let mut body = body;
     loop {
-        let mut builder = Request::builder();
-        builder.method(method).uri(&url);
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(&url);
         if let Some(ref jar) = cookies_jar {
-            builder.header("Cookie", jar.iter().map(|(key, value)| format!("{}={}", key, value)).collect::<Vec<String>>().join("; "));
+            builder = builder.header("Cookie", jar.iter().map(|(key, value)| format!("{}={}", key, value)).collect::<Vec<String>>().join("; "));
         }
         if let Some(ref h) = headers {
             for (name, value) in h {
-                builder.header(*name, value);
+                builder = builder.header(*name, value);
             }
         }
         let req = builder.body(if let Some(b) = body { Body::from(b) } else { Body::empty() }).map_err(|e| error!("error building request to {}: {}", url, e))?;
@@ -49,7 +50,7 @@ where C: Connect + 'static,
         let success = res.status().is_success();
         let redirect = res.status().is_redirection();
         let (head, stream) = res.into_parts();
-        let chunks = stream.try_concat().await.map_err(|e| error!("error while reading response from {}: {}", url, e))?;
+        let chunks = stream.map_ok(|c| c.to_vec()).try_concat().await.map_err(|e| error!("error while reading response from {}: {}", url, e))?;
         let res_body = String::from_utf8(chunks.to_vec()).map_err(|e| error!("error while encoding response from {}: {}", url, e))?;
         if success || redirect {
             if let Some(ref mut jar) = cookies_jar {
@@ -118,8 +119,7 @@ async fn main() -> Result<(), ()> {
             utf8_percent_encode(&cookies_jar["CSRF-TOKEN"], FRAGMENT)
         )), Some(&mut cookies_jar)).await?;
 
-    let (resolver, background) = AsyncResolver::new(ResolverConfig::default(), ResolverOpts::default());
-    tokio::spawn(background);
+    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default()).await.map_err(|e| error!("Failed to init Resolver: {}", e))?;
 
     loop {
         let body = call(&client, "GET", &format!("{}dashboard/settings", url), None, None, Some(&mut cookies_jar)).await?;
@@ -146,10 +146,10 @@ async fn main() -> Result<(), ()> {
 
         let mut addresses = Vec::new();
         for ddns in &ddnss {
-            let response = resolver.lookup_ip(*ddns).await.map_err(|e| error!("Failed to lookup \"{}\": {}", ddns, e))?;
-
-            for address in response.iter() {
-                addresses.push(format!("{}", address));
+            if let Ok(response) = resolver.lookup_ip(*ddns).await.map_err(|e| error!("Failed to lookup \"{}\": {}", ddns, e)) {
+                for address in response.iter() {
+                    addresses.push(format!("{}", address));
+                }
             }
         }
         let addresses = addresses.join(";");
